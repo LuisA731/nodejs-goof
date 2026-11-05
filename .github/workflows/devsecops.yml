@@ -201,6 +201,7 @@ jobs:
               -F "scan_type=${scan_type}" \
               -F "file=@results/${file}" \
               -F "product_name=${DD_PRODUCT_NAME}" \
+              -F "product_type_name=Research and Development" \
               -F "engagement_name=${ENGAGEMENT}" \
               -F "auto_create_context=true" \
               -F "active=true" \
