@@ -1,0 +1,224 @@
+name: DevSecOps Pipeline
+
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DD_PRODUCT_NAME: ${{ vars.DD_PRODUCT_NAME }}
+
+jobs:
+ 
+  secrets-scan:
+    name: 1 - Secret scan (TruffleHog)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (historial completo)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Instalar TruffleHog
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Escanear secretos (falla el pipeline si hay hallazgos)
+        shell: bash
+        run: |
+          set -o pipefail
+          # Se incluyen secretos "unverified" para detectar tambien credenciales ficticias de prueba
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # En PR: solo los commits introducidos por el PR
+            trufflehog git file://. \
+              --since-commit "${{ github.event.pull_request.base.sha }}" \
+              --branch "${{ github.event.pull_request.head.sha }}" \
+              --results=verified,unknown,unverified \
+              --json --fail --no-update | tee trufflehog.json
+          else
+            # En push/manual: todo el historial del repositorio
+            trufflehog git file://. \
+              --results=verified,unknown,unverified \
+              --json --fail --no-update | tee trufflehog.json
+          fi
+
+      - name: Subir resultados de TruffleHog
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trufflehog-results
+          path: trufflehog.json
+          if-no-files-found: warn
+
+
+  syft-sbom:
+    name: 2a - SBOM (Syft)
+    needs: secrets-scan
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Generar SBOM (CycloneDX y SPDX)
+        continue-on-error: true
+        run: |
+          syft dir:. \
+            -o cyclonedx-json=sbom.cdx.json \
+            -o spdx-json=sbom.spdx.json
+
+      - name: Subir SBOM
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: syft-sbom
+          path: |
+            sbom.cdx.json
+            sbom.spdx.json
+          if-no-files-found: warn
+
+  grype-scan:
+    name: 2b - Vulnerabilidades en dependencias (Grype)
+    needs: secrets-scan
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar Grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Escanear dependencias
+        continue-on-error: true
+        run: |
+          grype dir:. -o json > grype.json
+          grype dir:. -o table | tee grype.txt
+
+      - name: Subir resultados de Grype
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grype-results
+          path: |
+            grype.json
+            grype.txt
+          if-no-files-found: warn
+
+
+  snyk-code:
+    name: 3 - SAST (Snyk Code)
+    needs: [syft-sbom, grype-scan]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Instalar Snyk CLI
+        run: npm install -g snyk
+
+      - name: Snyk Code test
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          snyk code test --sarif-file-output=snyk-code.sarif
+
+      - name: Subir resultados de Snyk Code
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-code-results
+          path: snyk-code.sarif
+          if-no-files-found: warn
+
+
+  zap-baseline:
+    name: 4 - DAST (OWASP ZAP baseline)
+    needs: snyk-code
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Ejecutar ZAP baseline
+        continue-on-error: true
+        run: |
+          mkdir -p zap-out && chmod 777 zap-out
+          docker run --rm -v "$(pwd)/zap-out:/zap/wrk/:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t "${{ vars.DAST_TARGET_URL }}" \
+              -x zap-report.xml \
+              -J zap-report.json \
+              -r zap-report.html \
+              -I
+
+      - name: Subir resultados de ZAP
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-results
+          path: zap-out/
+          if-no-files-found: warn
+
+
+  defectdojo-upload:
+    name: Subir hallazgos a DefectDojo
+    needs: [secrets-scan, syft-sbom, grype-scan, snyk-code, zap-baseline]
+    if: ${{ always() && needs.secrets-scan.result == 'success' }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Descargar artefactos
+        uses: actions/download-artifact@v4
+        with:
+          path: results
+          merge-multiple: true
+
+      - name: Importar a DefectDojo
+        env:
+          DD_URL: ${{ secrets.DEFECTDOJO_URL }}
+          DD_TOKEN: ${{ secrets.DEFECTDOJO_TOKEN }}
+        shell: bash
+        run: |
+          ls -la results || true
+          ENGAGEMENT="GitHub Actions #${{ github.run_number }}"
+
+          import_scan () {
+            local file="$1" scan_type="$2"
+            if [ ! -s "results/$file" ]; then
+              echo "::warning::Sin archivo o vacio: $file (se omite $scan_type)"
+              return 0
+            fi
+            echo "Importando $file como '$scan_type'..."
+            curl -sS --fail-with-body -X POST "${DD_URL}/api/v2/import-scan/" \
+              -H "Authorization: Token ${DD_TOKEN}" \
+              -F "scan_type=${scan_type}" \
+              -F "file=@results/${file}" \
+              -F "product_name=${DD_PRODUCT_NAME}" \
+              -F "engagement_name=${ENGAGEMENT}" \
+              -F "auto_create_context=true" \
+              -F "active=true" \
+              -F "verified=false" \
+              -F "close_old_findings=false" \
+              -F "test_title=${scan_type}" || echo "::warning::Fallo la importacion de $file"
+          }
+
+          import_scan trufflehog.json       "Trufflehog Scan"
+          import_scan grype.json            "Anchore Grype"
+          import_scan snyk-code.sarif       "SARIF"
+          import_scan zap-report.xml        "ZAP Scan"
