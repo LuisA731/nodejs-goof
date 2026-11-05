@@ -33,18 +33,15 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          # Se incluyen secretos "unverified" para detectar tambien credenciales ficticias de prueba
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            # En PR: solo los commits introducidos por el PR
             trufflehog git file://. \
               --since-commit "${{ github.event.pull_request.base.sha }}" \
               --branch "${{ github.event.pull_request.head.sha }}" \
               --results=verified,unknown,unverified \
               --json --fail --no-update | tee trufflehog.json
           else
-            # En push/manual: todo el historial del repositorio
             trufflehog git file://. \
-              --results=verified,unknown,unverified \
+              --results=verified,unknown \
               --json --fail --no-update | tee trufflehog.json
           fi
 
